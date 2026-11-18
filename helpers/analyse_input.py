@@ -146,13 +146,22 @@ def validate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     return plan
 
 
-def analyze_task(task: TaskObject, memory: SessionMemory, client) -> Dict[str, Any]:
-    """Stage 2 (large model): decompose into substeps with risks, dependencies and rollback hints."""
+def analyze_task(task: TaskObject, memory: SessionMemory, client, review_findings=None) -> Dict[str, Any]:
+    """Stage 2 (large model): decompose into substeps with risks, dependencies and rollback hints.
+
+    review_findings: findings from a rejected plan review; passed back so the re-plan addresses them.
+    """
+    feedback = ""
+    if review_findings:
+        feedback = (
+            "\nYour previous plan was REJECTED by an independent reviewer. Fix these findings:\n"
+            f"{json.dumps(review_findings, indent=2)}\n"
+        )
     prompt = f"""You are analyzing this task deeply before any execution happens.
 
 TASK:
 {json.dumps(asdict(task), indent=2)}
-
+{feedback}
 Return pure JSON:
 {{
   "task_summary": "one-line summary",
