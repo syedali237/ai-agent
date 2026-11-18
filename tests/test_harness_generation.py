@@ -11,85 +11,125 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helpers.analyse_input import AnalysisError, TaskObject  # noqa: E402
 from helpers.generate_harness import run_harness_generation, validate_harness  # noqa: E402
 from helpers.session_memory import SessionMemory, SessionState  # noqa: E402
+from helpers.tool_registry import BUILTIN_TOOLS  # noqa: E402
 
+REG = dict(BUILTIN_TOOLS)
 STEP = {"step_id": 1, "goal": "edit foo", "type": "refactor", "dependencies": [],
         "estimated_effort": 2, "rollback_hint": "restore snapshot", "confidence_score": 0.8}
 READ_STEP = {**STEP, "step_id": 2, "type": "research", "goal": "read foo"}
 PLAN = {"must_not_break": [], "substeps": [STEP, READ_STEP]}
 
 GOOD = {
-    "allowed_tools": ["get_file_content", "write_file"],
-    "tool_limits": {"get_file_content": {"max_per_step": 5}, "write_file": {"max_per_step": 2},
-                    "run_python_file": {"max_per_step": 9, "timeout_seconds": 5}},
     "guardrails": {
-        "file_access": {"allowed_read": ["src/**"], "allowed_write": ["src/foo.py"], "forbidden_write": ["tests/**"]},
-        "resource_limits": {"max_duration_seconds": 60},
+        "scope": {"allowed_tools": ["get_file_content", "write_file"], "allowed_read": ["src/**"],
+                  "allowed_write": ["src/foo.py"], "forbidden_write": ["tests/**"]},
+        "limits": {"tool_limits": {"get_file_content": {"max_per_step": 5}, "write_file": {"max_per_step": 2},
+                                   "run_python_file": {"max_per_step": 9, "timeout_seconds": 5}},
+                   "max_duration_seconds": 60},
+        "content": {"must_not_modify": ["bar()"], "must_preserve": []},
     },
     "validation_checks": [{"name": "syntax", "check": "python -m py_compile src/foo.py"}],
     "rollback_plan": {"actions": ["restore src/foo.py from snapshot"], "test_rollback": "diff against snapshot"},
     "success_criteria": ["foo() returns 1"],
     "confidence_score": 0.95,
 }
-READ_ONLY = {**GOOD, "allowed_tools": ["get_file_content"],
-             "guardrails": {**GOOD["guardrails"],
-                            "file_access": {"allowed_read": ["src/**"], "allowed_write": [], "forbidden_write": []}},
-             "rollback_plan": {"actions": [], "test_rollback": ""}}
+READ_ONLY = {
+    "guardrails": {
+        "scope": {"allowed_tools": ["get_file_content"], "allowed_read": ["src/**"], "allowed_write": [], "forbidden_write": []},
+        "limits": {"tool_limits": {"get_file_content": {"max_per_step": 5}}, "max_duration_seconds": 30},
+    },
+    "validation_checks": [{"name": "read", "check": "file content returned"}],
+    "rollback_plan": {"actions": [], "test_rollback": ""},
+    "success_criteria": ["foo located"],
+    "confidence_score": 0.9,
+}
 
 
-def variant(**overrides):
-    d = copy.deepcopy(GOOD)
-    d.update(overrides)
-    return d
+def good():
+    return copy.deepcopy(GOOD)
+
+
+def v(data, step=STEP):
+    return validate_harness(data, step, REG)
 
 
 def test_valid_harness_passes_and_caps_confidence_at_step_confidence():
-    out = validate_harness(copy.deepcopy(GOOD), STEP)
+    out = v(good())
     assert out["confidence_score"] == 0.8  # min(0.95, step 0.8)
-    assert set(out["tool_limits"]) == {"get_file_content", "write_file"}  # ungranted limit dropped
+    assert set(out["guardrails"]["limits"]["tool_limits"]) == {"get_file_content", "write_file"}
+    assert set(out["guardrails"]) == {"scope", "limits", "content"}
+
+
+def test_cannot_exceed_three_guardrail_layers():
+    d = good()
+    d["guardrails"]["extra"] = {}
+    with pytest.raises(AnalysisError):
+        v(d)
+
+
+def _mutate(path, value):
+    d = good()
+    target = d
+    for key in path[:-1]:
+        target = target[key]
+    if value is DELETE:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+    return d
+
+
+DELETE = object()
 
 
 @pytest.mark.parametrize("bad", [
-    variant(allowed_tools=["get_file_content", "rm_rf"]),
-    variant(allowed_tools=[]),
-    variant(validation_checks=[]),
-    variant(success_criteria=[]),
-    variant(rollback_plan={"actions": []}),
-    variant(confidence_score=1.5),
+    _mutate(["guardrails", "scope", "allowed_tools"], ["get_file_content", "rm_rf"]),
+    _mutate(["guardrails", "scope", "allowed_tools"], []),
+    _mutate(["guardrails", "scope"], DELETE),
+    _mutate(["guardrails", "limits"], DELETE),
+    _mutate(["guardrails", "content"], DELETE),                       # writer without content layer
+    _mutate(["guardrails", "content"], {"must_not_modify": [], "must_preserve": []}),
+    _mutate(["guardrails", "limits", "max_duration_seconds"], 0),
+    _mutate(["validation_checks"], []),
+    _mutate(["success_criteria"], []),
+    _mutate(["rollback_plan"], {"actions": []}),
+    _mutate(["confidence_score"], 1.5),
 ])
 def test_invalid_harnesses_rejected(bad):
     with pytest.raises(AnalysisError):
-        validate_harness(bad, STEP)
+        v(bad)
 
 
 @pytest.mark.parametrize("pattern", ["/etc/passwd", "C:/Windows", "../secrets", "src/../../x", "**", "*", "~/x"])
 def test_unsafe_write_patterns_rejected(pattern):
-    bad = copy.deepcopy(GOOD)
-    bad["guardrails"]["file_access"]["allowed_write"] = [pattern]
     with pytest.raises(AnalysisError):
-        validate_harness(bad, STEP)
+        v(_mutate(["guardrails", "scope", "allowed_write"], [pattern]))
 
 
 def test_write_without_explicit_scope_rejected():
-    bad = copy.deepcopy(GOOD)
-    bad["guardrails"]["file_access"]["allowed_write"] = []
     with pytest.raises(AnalysisError):
-        validate_harness(bad, STEP)
+        v(_mutate(["guardrails", "scope", "allowed_write"], []))
 
 
 def test_research_step_cannot_write():
     with pytest.raises(AnalysisError):
-        validate_harness(copy.deepcopy(GOOD), READ_STEP)
+        v(good(), READ_STEP)
 
 
-def test_read_only_step_needs_no_rollback_actions():
-    assert validate_harness(copy.deepcopy(READ_ONLY), READ_STEP)["allowed_tools"] == ["get_file_content"]
+def test_read_only_step_needs_no_rollback_actions_or_content_layer():
+    out = v(copy.deepcopy(READ_ONLY), READ_STEP)
+    assert set(out["guardrails"]) == {"scope", "limits"}
 
 
 def test_run_python_needs_timeout():
-    bad = variant(allowed_tools=["run_python_file"], tool_limits={"run_python_file": {"max_per_step": 1}})
-    bad["guardrails"]["file_access"]["allowed_write"] = []
+    d = copy.deepcopy(READ_ONLY)
+    d["guardrails"]["scope"]["allowed_tools"] = ["run_python_file"]
+    d["guardrails"]["limits"]["tool_limits"] = {"run_python_file": {"max_per_step": 1}}
+    d["rollback_plan"] = {"actions": ["none"], "test_rollback": ""}
     with pytest.raises(AnalysisError):
-        validate_harness(bad, STEP)
+        v(d, STEP)
+    d["guardrails"]["limits"]["tool_limits"]["run_python_file"]["timeout_seconds"] = 5
+    assert v(d, STEP)["guardrails"]["limits"]["tool_limits"]["run_python_file"]["timeout_seconds"] == 5
 
 
 class FakeClient:
@@ -111,21 +151,23 @@ def setup():
 def test_run_generation_stores_harness_per_step():
     memory, sid, task = setup()
     client = FakeClient(json.dumps(GOOD), json.dumps(READ_ONLY))
-    result = run_harness_generation(task, PLAN, memory, client)
+    result = run_harness_generation(task, PLAN, memory, client, REG)
     assert result["status"] == "generated"
-    assert set(memory.get(f"session:{sid}:harness")) == {1, 2}
+    stored = memory.get(f"session:{sid}:harness")
+    assert set(stored) == {1, 2}
+    assert result["harnesses"][1].allowed_tools == ["get_file_content", "write_file"]
 
 
 def test_run_generation_escalates_on_invalid_harness():
     memory, sid, task = setup()
-    client = FakeClient(json.dumps(variant(validation_checks=[])))
-    assert run_harness_generation(task, PLAN, memory, client)["status"] == "needs_human_review"
+    client = FakeClient(json.dumps(_mutate(["validation_checks"], [])))
+    assert run_harness_generation(task, PLAN, memory, client, REG)["status"] == "needs_human_review"
     assert memory.get_state(sid) is SessionState.NEEDS_HUMAN_REVIEW
 
 
 def test_run_generation_escalates_on_low_confidence():
     memory, sid, task = setup()
-    client = FakeClient(json.dumps(variant(confidence_score=0.4)), json.dumps(READ_ONLY))
-    result = run_harness_generation(task, PLAN, memory, client)
+    client = FakeClient(json.dumps(_mutate(["confidence_score"], 0.4)), json.dumps(READ_ONLY))
+    result = run_harness_generation(task, PLAN, memory, client, REG)
     assert result["status"] == "needs_human_review"
     assert memory.get_state(sid) is SessionState.NEEDS_HUMAN_REVIEW

@@ -180,7 +180,8 @@ Return pure JSON:
     }}
   ]
 }}
-Number steps from 1. A step may depend only on lower-numbered steps."""
+Number steps from 1. A step may depend only on lower-numbered steps.
+Do not pad the plan: a simple task (estimated_complexity 1-2) is usually one substep."""
     data = call_json(client, model=config.ANALYSIS_MODEL, max_tokens=4000, prompt=prompt)
     plan = validate_plan(data)
 

@@ -32,7 +32,14 @@ Model IDs live in `config.py` only. Different models for different jobs is the p
 
 ## Harness (one per substep)
 
-`step_id`, `goal`, `allowed_tools`, `tool_limits`, `guardrails` (file read/write allow and forbid lists, resource limits), `validation_checks`, `rollback_plan`, `success_criteria`, `confidence_score`.
+`step_id`, `goal`, `guardrails`, `validation_checks`, `rollback_plan`, `success_criteria`, `confidence_score`.
+
+`guardrails` has at most 3 layers, each checked separately (`helpers/guardrails.py`):
+- `scope`: `allowed_tools`, `allowed_read` / `allowed_write` / `forbidden_write` globs
+- `limits`: per-tool `max_per_step` (+ `timeout_seconds` for code-running tools), `max_duration_seconds`
+- `content`: `must_not_modify`, `must_preserve`; required when any granted tool writes files, checked after the write (phase 5/6)
+
+Tools come from `helpers/tool_registry.py`: built-ins plus human-authored manifests in `custom_tools/` (see its README). The model can be granted a registered, enabled tool but can never create one.
 
 ## Execution policy (hard rules)
 
