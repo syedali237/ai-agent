@@ -3,6 +3,14 @@ import os
 
 MAX_CHARS = 10000  # Maximum number of characters to read from the file
 
+# Model IDs live here only. Different models for different jobs: the model that
+# executes a step must never be the only one to judge it.
+INTAKE_MODEL = "claude-haiku-4-5"      # small/cheap: normalize the request
+ANALYSIS_MODEL = "claude-opus-5-5"     # large: decompose into substeps
+REVIEW_MODEL = "claude-sonnet-5-5"     # second large: harness gen + plan review
+EXECUTION_MODEL = "claude-haiku-4-5"   # small/fast: run one step in its harness
+VERIFY_MODEL = "claude-opus-5-5"       # large: compare plan vs. what happened
+
 
 def resolve_path_in_workdir(working_dir, input_path):
 	abs_working_dir = os.path.abspath(os.path.expanduser(working_dir))
