@@ -12,12 +12,10 @@ from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import anthropic  # noqa: E402
-from dotenv import load_dotenv  # noqa: E402
-
-import config  # noqa: E402
+import config  # noqa: E402  (loads .env)
 from helpers.analyse_input import analyze_task, run_analysis  # noqa: E402
 from helpers.generate_harness import run_harness_generation  # noqa: E402
+from helpers.llm import LLMError, check_role_independence, make_client, missing_keys, ROLES  # noqa: E402
 from helpers.session_memory import MAX_PLAN_ATTEMPTS, SessionMemory, SessionState  # noqa: E402
 from helpers.verify_harness import review_gate  # noqa: E402
 
@@ -40,13 +38,11 @@ def main():
         del args[i:i + 2]
     prompt = args[0] if args else DEFAULT_PROMPT
 
-    load_dotenv()
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY is not set (put it in .env)")
-    client = anthropic.Anthropic()
-
-    print("Models:", {k: getattr(config, k) for k in
-                      ("INTAKE_MODEL", "ANALYSIS_MODEL", "REVIEW_MODEL", "EXECUTION_MODEL", "VERIFY_MODEL")})
+    print("Models:", {k: getattr(config, k) for k in ROLES})
+    check_role_independence()
+    if missing_keys():
+        sys.exit(f"Missing environment variables (set them in .env, see .env.example): {', '.join(missing_keys())}")
+    client = make_client()
     print("Prompt:", prompt)
 
     memory = SessionMemory()
@@ -94,8 +90,8 @@ def main():
                 break
             findings = gate["review"]["findings"]
             memory.transition(sid, SessionState.ANALYZED)
-    except anthropic.APIError as e:
-        print(f"\nAPI ERROR: {type(e).__name__}: {e}")
+    except LLMError as e:
+        print(f"\nAPI ERROR: {e}")
         report["final"] = {"status": "api_error", "reason": str(e)}
     finish(report, memory, sid, out_path)
 
