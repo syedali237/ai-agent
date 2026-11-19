@@ -5,7 +5,7 @@ from anthropic.types import ToolParam
 from config import resolve_path_in_workdir
 
 
-def run_python_file(working_dir, file_path : str, args : list = []):
+def run_python_file(working_dir, file_path : str, args : list = [], timeout : float = 30):
     abs_working_dir, abs_file_path = resolve_path_in_workdir(working_dir, file_path)
     if os.path.commonpath([abs_working_dir, abs_file_path]) != abs_working_dir:
         return f'Error: "{file_path}" is not within the working directory.'
@@ -19,7 +19,7 @@ def run_python_file(working_dir, file_path : str, args : list = []):
     try:
         final_args = ["python", file_path]
         final_args.extend(args)
-        output = subprocess.run(final_args, cwd=abs_working_dir, timeout=30, check=True, capture_output=True, text=True)
+        output = subprocess.run(final_args, cwd=abs_working_dir, timeout=timeout, check=True, capture_output=True, text=True)
         final_string = f"""
 STDOUT: {output.stdout}
 STDERR: {output.stderr}

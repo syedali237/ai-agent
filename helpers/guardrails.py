@@ -44,7 +44,7 @@ def path_matches(patterns: List[str], rel_path: str) -> bool:
     return any(_glob_regex(p).match(rel_path) for p in patterns)
 
 
-def _resolve(working_dir: str, value: Any) -> Tuple[Optional[str], Optional[str]]:
+def resolve_in_workspace(working_dir: str, value: Any) -> Tuple[Optional[str], Optional[str]]:
     """Return (workspace-relative posix path, None) or (None, error). Follows symlinks."""
     if not isinstance(value, str):
         return None, f"path argument must be a string, got {type(value).__name__}"
@@ -65,7 +65,7 @@ def check_scope(harness: Dict[str, Any], spec: ToolSpec, args: Dict[str, Any], w
         return f"tool '{spec.name}' is not allowed in this step"
     for param in spec.path_params:
         # A missing path argument means the tool falls back to its default, so check "." (deny by default).
-        rel, error = _resolve(working_dir, args.get(param, "."))
+        rel, error = resolve_in_workspace(working_dir, args.get(param, "."))
         if error:
             return error
         if spec.writes_files:
