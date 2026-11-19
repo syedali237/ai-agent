@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 from helpers.analyse_input import AnalysisError, analyze_task, run_analysis
 from helpers.execution import cleanup_session, execute_step, rollback_journal
 from helpers.generate_harness import run_harness_generation
+from helpers.llm import LLMError, check_role_independence
 from helpers.session_memory import MAX_PLAN_ATTEMPTS, MAX_STEP_RETRIES, SessionMemory, SessionState
 from helpers.tool_registry import ToolSpec, load_registry
 from helpers.verify_harness import review_gate
@@ -46,10 +47,18 @@ def _rollback_all(task, memory: SessionMemory, working_dir: str, reason: str, **
 
 def run_agent_task(user_prompt: str, client, working_dir: str, registry: Optional[Dict[str, ToolSpec]] = None,
                    memory: Optional[SessionMemory] = None) -> Dict[str, Any]:
+    check_role_independence()  # misconfiguration raises here, before anything runs
     memory = memory if memory is not None else SessionMemory()
     registry = registry if registry is not None else load_registry()
     sid = memory.start_session(user_prompt)
+    try:
+        return _run_session(sid, user_prompt, client, working_dir, registry, memory)
+    except LLMError as e:  # provider down, bad key, malformed reply: stop and keep state for a human
+        return _escalate(memory, sid, f"model API error: {e}")
 
+
+def _run_session(sid: str, user_prompt: str, client, working_dir: str, registry: Dict[str, ToolSpec],
+                 memory: SessionMemory) -> Dict[str, Any]:
     # Stages 1-2: intake + analysis
     analysis = run_analysis(user_prompt, sid, memory, client)
     if analysis["status"] != "analyzed":
@@ -64,7 +73,7 @@ def run_agent_task(user_prompt: str, client, working_dir: str, registry: Optiona
                 plan = analyze_task(task, memory, client, review_findings=findings)
             except (AnalysisError, ValueError) as e:
                 return _escalate(memory, sid, f"re-analysis failed: {e}")
-        generated = run_harness_generation(task, plan, memory, client, registry)
+        generated = run_harness_generation(task, plan, memory, client, registry, review_findings=findings)
         if generated["status"] != "generated":
             return {"status": "needs_human_review", "session_id": sid, "reason": generated["reason"]}
         gate = review_gate(task, plan, memory, client, {s: asdict(h) for s, h in generated["harnesses"].items()})

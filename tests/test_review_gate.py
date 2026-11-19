@@ -66,6 +66,16 @@ def test_low_confidence_goes_to_human_review():
     assert memory.get_state(sid) is SessionState.NEEDS_HUMAN_REVIEW
 
 
+def test_extreme_adjustment_on_a_fixable_plan_is_clamped_so_replanning_still_happens():
+    memory, sid, task = setup()
+    findings = [{"severity": "critical", "issue": "contradictory guardrail", "recommendation": "fix it"}]
+    confident = {**PLAN, "substeps": [{**s, "confidence_score": 0.98} for s in PLAN["substeps"]]}
+    result = review_gate(task, confident, memory, FakeClient(review(approved=False, findings=findings, adj=-1.0)))
+    assert result["status"] == "rejected"  # not needs_human_review
+    assert result["review"]["confidence_adjustment"] == -0.3
+    assert memory.get_state(sid) is SessionState.REJECTED
+
+
 def test_garbage_review_escalates():
     memory, sid, task = setup()
     result = review_gate(task, PLAN, memory, FakeClient("nope", "still nope"))

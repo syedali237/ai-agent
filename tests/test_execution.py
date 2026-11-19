@@ -241,6 +241,45 @@ def test_custom_tool_dispatch_and_timeout(wd, tmp_path_factory, monkeypatch):
     time.sleep(0.5)  # let the lingering worker finish before the tmp dir is cleaned up
 
 
+def _journal_with_script_run(memory, sid, wd, changed):
+    """A step that wrote src/a.py (journaled) and also ran a script (unjournaled)."""
+    root = os.path.join(wd, "..")
+    write = record_before_mutation(BUILTIN_TOOLS["write_file"], {"file_path": "src/a.py"}, wd, root, 1, 1)
+    run = record_before_mutation(BUILTIN_TOOLS["run_python_file"], {"file_path": "src/a.py"}, wd, root, 2, 1)
+    memory.set(f"session:{sid}:journal", [write, run])
+    memory.set(f"session:{sid}:execution_log", {1: {"changed_files": changed}})
+
+
+def test_unjournaled_tool_is_not_a_blocker_when_every_file_change_was_restored(wd):
+    memory, task = setup([harness()])
+    _journal_with_script_run(memory, task.session_id, wd,   # snapshot first, as the executor does
+                             {"created": [], "deleted": [], "modified": ["src/a.py"], "truncated": False})
+    open(os.path.join(wd, "src", "a.py"), "w").write("changed by the step")
+    reports = rollback_journal(task, memory, wd)
+    assert all(r["ok"] for r in reports) and read(wd, "src/a.py") == "old"
+    assert memory.get(f"session:{task.session_id}:journal") == []
+
+
+def test_unjournaled_tool_still_blocks_when_it_changed_files_nothing_can_restore(wd):
+    memory, task = setup([harness()])
+    open(os.path.join(wd, "src", "stray.txt"), "w").write("made by a script")
+    _journal_with_script_run(memory, task.session_id, wd,
+                             {"created": ["src/stray.txt"], "deleted": [], "modified": [], "truncated": False})
+    reports = rollback_journal(task, memory, wd)
+    assert [r["ok"] for r in sorted(reports, key=lambda r: r["seq"])] == [True, False]
+    assert len(memory.get(f"session:{task.session_id}:journal")) == 1  # the unrecoverable entry stays
+
+
+def test_unjournaled_tool_blocks_when_the_diff_is_unreliable(wd):
+    memory, task = setup([harness()])
+    for changed in ({"created": [], "deleted": [], "modified": [], "truncated": True}, None):
+        _journal_with_script_run(memory, task.session_id, wd,
+                                 changed or {"created": [], "deleted": [], "modified": [], "truncated": False})
+        if changed is None:
+            memory.set(f"session:{task.session_id}:execution_log", {})  # step crashed, nothing recorded
+        assert not all(r["ok"] for r in rollback_journal(task, memory, wd))
+
+
 # --- snapshots in isolation ---
 
 def test_snapshot_too_large_is_refused(wd, monkeypatch):

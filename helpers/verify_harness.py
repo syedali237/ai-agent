@@ -15,6 +15,7 @@ from helpers.json_utils import call_json
 from helpers.session_memory import MAX_PLAN_ATTEMPTS, SessionMemory, SessionState
 
 SEVERITIES = {"critical", "warning", "info"}
+MIN_ADJUSTMENT, MAX_ADJUSTMENT = -0.3, 0.1
 
 
 def validate_review(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -32,7 +33,10 @@ def validate_review(data: Dict[str, Any]) -> Dict[str, Any]:
     adjustment = data.get("confidence_adjustment", 0.0)
     if isinstance(adjustment, bool) or not isinstance(adjustment, (int, float)) or not -1 <= adjustment <= 1:
         raise AnalysisError(f"invalid confidence_adjustment: {adjustment!r}")
-    return {"approved": data["approved"], "findings": findings, "confidence_adjustment": float(adjustment)}
+    # The adjustment is a nudge. Severity belongs in findings: a model that answers -1.0 for a fixable
+    # problem would otherwise skip the re-plan loop and go straight to human review.
+    return {"approved": data["approved"], "findings": findings,
+            "confidence_adjustment": max(MIN_ADJUSTMENT, min(MAX_ADJUSTMENT, float(adjustment)))}
 
 
 def plan_confidence(plan: Dict[str, Any], adjustment: float) -> float:

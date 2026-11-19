@@ -16,11 +16,13 @@ from typing import Any, Dict, List, Optional
 
 import config
 from helpers.analyse_input import CONFIDENCE_MIN, AnalysisError, TaskObject
-from helpers.json_utils import call_json
+from helpers.guardrails import path_matches
+from helpers.json_utils import call_validated
 from helpers.session_memory import SessionMemory, SessionState
 from helpers.tool_registry import ToolSpec, load_registry
 
 GUARDRAIL_LAYERS = ("scope", "limits", "content")  # hard cap: 3 layers per step
+MIN_STEP_SECONDS = 60  # floor for limits.max_duration_seconds (it includes model round-trips)
 # Step types that must never write files, regardless of what the model proposes.
 READ_ONLY_STEP_TYPES = {"research", "design", "validation"}
 
@@ -103,7 +105,8 @@ def _validate_limits(sid: int, tools: List[str], limits: Any, registry: Dict[str
     duration = limits.get("max_duration_seconds")
     if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
         raise AnalysisError(f"step {sid}: limits.max_duration_seconds must be positive")
-    return {"tool_limits": per_tool, "max_duration_seconds": duration}
+    # The budget covers model latency too, so a tiny model-proposed value would fail every step.
+    return {"tool_limits": per_tool, "max_duration_seconds": max(duration, MIN_STEP_SECONDS)}
 
 
 def _validate_content(sid: int, content: Any, needed: bool) -> Optional[Dict[str, Any]]:
@@ -113,10 +116,7 @@ def _validate_content(sid: int, content: Any, needed: bool) -> Optional[Dict[str
         return None
     if not isinstance(content, dict):
         raise AnalysisError(f"step {sid}: guardrails.content must be an object")
-    out = {k: _str_list(content.get(k, []), f"content.{k}") for k in ("must_not_modify", "must_preserve")}
-    if needed and not (out["must_not_modify"] or out["must_preserve"]):
-        raise AnalysisError(f"step {sid}: content layer must name what to preserve or not modify")
-    return out
+    return {k: _str_list(content.get(k, []), f"content.{k}") for k in ("must_not_modify", "must_preserve")}
 
 
 def validate_harness(data: Dict[str, Any], step: Dict[str, Any], registry: Optional[Dict[str, ToolSpec]] = None) -> Dict[str, Any]:
@@ -138,6 +138,13 @@ def validate_harness(data: Dict[str, Any], step: Dict[str, Any], registry: Optio
     content = _validate_content(sid, layers.get("content"), needed=writes)
     guardrails: Dict[str, Any] = {"scope": scope, "limits": limits}
     if content is not None:
+        # A step cannot be both allowed and forbidden to change the same file.
+        clash = [p for p in content["must_not_modify"] if path_matches(scope["allowed_write"], p)]
+        if clash:
+            raise AnalysisError(
+                f"step {sid}: content.must_not_modify {clash} overlaps allowed_write, which this step must be "
+                "able to change. List only things the step must leave untouched (functions, other files)."
+            )
         guardrails["content"] = content
 
     # Rule 2: never execute a step with no validation strategy.
@@ -182,12 +189,32 @@ def _tool_catalog(registry: Dict[str, ToolSpec]) -> str:
     return "\n".join(lines)
 
 
+def _fill_content_layer(data: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    """A step that can write must carry a content layer. If the model left it out or empty, take
+    what must be preserved from the plan's own must_not_break list instead of making the model invent it."""
+    guard = data.get("guardrails") if isinstance(data, dict) else None
+    scope = guard.get("scope") if isinstance(guard, dict) else None
+    if not isinstance(scope, dict) or not scope.get("allowed_write"):
+        return data
+    content = guard.get("content")
+    if not isinstance(content, dict):
+        content = {}
+    if not content.get("must_not_modify") and not content.get("must_preserve"):
+        content = {"must_not_modify": [], "must_preserve": [str(x) for x in plan.get("must_not_break", [])]}
+    return {**data, "guardrails": {**guard, "content": content}}
+
+
 def generate_harness(task: TaskObject, plan: Dict[str, Any], step: Dict[str, Any], client,
-                     registry: Optional[Dict[str, ToolSpec]] = None) -> Harness:
+                     registry: Optional[Dict[str, ToolSpec]] = None, review_findings=None) -> Harness:
     registry = registry if registry is not None else load_registry()
+    feedback = (
+        "\nA previous version of this plan's harnesses was REJECTED by an independent reviewer. "
+        f"Fix these findings where they concern this step:\n{json.dumps(review_findings, indent=2)}\n"
+        if review_findings else ""
+    )
     prompt = f"""Generate a harness (guardrails) for ONE step of a plan.
 Be as restrictive as the goal allows: least tools, narrowest file scope.
-
+{feedback}
 TASK: {task.user_prompt}
 TASK CONSTRAINTS: {json.dumps(task.constraints)}
 MUST NOT BREAK: {json.dumps(plan.get('must_not_break', []))}
@@ -199,7 +226,9 @@ Available tools (grant only these):
 {_tool_catalog(registry)}
 All paths are workspace-relative globs. No absolute paths, no "..", no bare "*" or "**".
 Guardrails have at most 3 layers: scope, limits, content. The content layer is required when any
-granted tool writes files and must name something to preserve or not modify.
+granted tool writes files; list code/behaviour that must survive (it may be empty if nothing applies).
+forbidden_write lists specific files only (it may be empty): anything outside allowed_write is already
+forbidden, so never use "*" or "**" there.
 
 Return pure JSON:
 {{
@@ -217,29 +246,31 @@ Return pure JSON:
   "confidence_score": 0.0-1.0
 }}
 (timeout_seconds is required for tools that run code.)"""
-    data = call_json(client, model=config.REVIEW_MODEL, max_tokens=2500, prompt=prompt)
-    checked = validate_harness(data, step, registry)
+    checked = call_validated(client, model=config.HARNESS_MODEL, max_tokens=2500, prompt=prompt,
+                             validate=lambda d: validate_harness(_fill_content_layer(d, plan), step, registry),
+                             errors=AnalysisError, attempts=3)
     return Harness(
         step_id=step["step_id"], goal=step["goal"], execution_model=config.EXECUTION_MODEL, **checked
     )
 
 
 def generate_harnesses(task: TaskObject, plan: Dict[str, Any], memory: SessionMemory, client,
-                       registry: Optional[Dict[str, ToolSpec]] = None) -> Dict[int, Harness]:
+                       registry: Optional[Dict[str, ToolSpec]] = None, review_findings=None) -> Dict[int, Harness]:
     """One harness per substep, stored at session:{id}:harness as {step_id: harness dict}."""
     registry = registry if registry is not None else load_registry()
     harnesses = {
-        step["step_id"]: generate_harness(task, plan, step, client, registry) for step in plan["substeps"]
+        step["step_id"]: generate_harness(task, plan, step, client, registry, review_findings)
+        for step in plan["substeps"]
     }
     memory.set(f"session:{task.session_id}:harness", {sid: asdict(h) for sid, h in harnesses.items()})
     return harnesses
 
 
 def run_harness_generation(task: TaskObject, plan: Dict[str, Any], memory: SessionMemory, client,
-                           registry: Optional[Dict[str, ToolSpec]] = None) -> Dict[str, Any]:
+                           registry: Optional[Dict[str, ToolSpec]] = None, review_findings=None) -> Dict[str, Any]:
     """Generate all harnesses; escalate (never guess) if any is unusable or too uncertain."""
     try:
-        harnesses = generate_harnesses(task, plan, memory, client, registry)
+        harnesses = generate_harnesses(task, plan, memory, client, registry, review_findings)
     except (AnalysisError, ValueError) as e:
         memory.transition(task.session_id, SessionState.NEEDS_HUMAN_REVIEW)
         return {"status": "needs_human_review", "reason": f"harness generation failed: {e}"}

@@ -38,7 +38,10 @@ JSON_TYPES = {"string": str, "array": list, "object": dict, "boolean": bool, "in
 SYSTEM_PROMPT = (
     "You are executing exactly ONE step of an already-approved plan inside a sandboxed workspace. "
     "Use only the tools you are given and stay inside the stated file scope. Paths are relative to the "
-    "workspace. If a call is blocked, do not try to work around it: stop and explain what you needed."
+    "workspace. If a call is blocked, do not try to work around it: stop and explain what you needed. "
+    "Know your tools' limits: run_python_file runs ONE .py file (file_path must end in .py; arguments go in "
+    "args), so it cannot run `python -m pytest`. If you cannot do something with your tools, such as running "
+    "the tests, do not keep trying: finish and say so in your summary."
 )
 
 
@@ -284,7 +287,28 @@ def rollback_journal(task: TaskObject, memory: SessionMemory, working_dir: str,
     """Undo journaled mutations newest-first (one step, or the whole session). Phase 6 decides when."""
     entries = memory.get(f"session:{task.session_id}:journal") or []
     selected = [e for e in entries if step_id is None or e["step_id"] == step_id]
+
+    # Files this undo can restore, vs. files the steps really changed (from the workspace diff).
+    covered = {snap["rel"] for e in selected for snap in e.get("snapshots", [])}
+    logs = memory.get(f"session:{task.session_id}:execution_log") or {}
+    touched, uncertain = set(), False
+    for sid_ in {e["step_id"] for e in selected}:
+        changed = (logs.get(sid_) or {}).get("changed_files")
+        if changed is None:  # step crashed before it could record what it changed
+            uncertain = True
+            continue
+        touched |= set(changed["created"]) | set(changed["modified"]) | set(changed["deleted"])
+        uncertain = uncertain or changed["truncated"]
+
     reports = rollback_entries(selected, os.path.realpath(working_dir))
+    if not uncertain and touched <= covered:
+        # An unjournaled tool (e.g. run_python_file) cannot be undone from a snapshot, but if every
+        # file change in the workspace is one we just restored, there is nothing left to undo.
+        for report in reports:
+            if report["strategy"] is None and not report["ok"]:
+                report["ok"] = True
+                report["detail"] = ("no workspace changes beyond journaled files; side effects outside the "
+                                    "workspace (processes, network) cannot be checked")
     done = {r["seq"] for r in reports if r["ok"]}
     memory.set(f"session:{task.session_id}:journal", [e for e in entries if e["seq"] not in done])
     return reports

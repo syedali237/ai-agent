@@ -88,7 +88,6 @@ DELETE = object()
     _mutate(["guardrails", "scope"], DELETE),
     _mutate(["guardrails", "limits"], DELETE),
     _mutate(["guardrails", "content"], DELETE),                       # writer without content layer
-    _mutate(["guardrails", "content"], {"must_not_modify": [], "must_preserve": []}),
     _mutate(["guardrails", "limits", "max_duration_seconds"], 0),
     _mutate(["validation_checks"], []),
     _mutate(["success_criteria"], []),
@@ -158,11 +157,72 @@ def test_run_generation_stores_harness_per_step():
     assert result["harnesses"][1].allowed_tools == ["get_file_content", "write_file"]
 
 
-def test_run_generation_escalates_on_invalid_harness():
+def test_run_generation_escalates_on_invalid_harness_after_one_corrective_retry():
     memory, sid, task = setup()
-    client = FakeClient(json.dumps(_mutate(["validation_checks"], [])))
+    bad = json.dumps(_mutate(["validation_checks"], []))
+    client = FakeClient(bad, bad, bad)
     assert run_harness_generation(task, PLAN, memory, client, REG)["status"] == "needs_human_review"
     assert memory.get_state(sid) is SessionState.NEEDS_HUMAN_REVIEW
+
+
+def test_invalid_harness_is_corrected_when_the_model_sees_its_error():
+    memory, sid, task = setup()
+    prompts = []
+
+    class Spy(FakeClient):
+        def create(self, **kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            return super().create(**kwargs)
+
+    no_checks = _mutate(["validation_checks"], [])
+    client = Spy(json.dumps(no_checks), json.dumps(GOOD), json.dumps(READ_ONLY))
+    result = run_harness_generation(task, PLAN, memory, client, REG)
+    assert result["status"] == "generated"
+    assert "previous answer was rejected" in prompts[1] and "at least one validation check" in prompts[1]
+
+
+def test_empty_or_missing_content_layer_is_filled_from_the_plan():
+    plan = {**PLAN, "must_not_break": ["existing add()"]}
+    for content in ({"must_not_modify": [], "must_preserve": []}, DELETE):
+        memory, sid, task = setup()
+        client = FakeClient(json.dumps(_mutate(["guardrails", "content"], content)), json.dumps(READ_ONLY))
+        result = run_harness_generation(task, plan, memory, client, REG)
+        assert result["status"] == "generated"
+        assert result["harnesses"][1].guardrails["content"]["must_preserve"] == ["existing add()"]
+
+
+def test_model_supplied_content_is_kept_over_the_plan_default():
+    plan = {**PLAN, "must_not_break": ["from plan"]}
+    memory, sid, task = setup()
+    result = run_harness_generation(task, plan, memory, FakeClient(json.dumps(GOOD), json.dumps(READ_ONLY)), REG)
+    assert result["harnesses"][1].guardrails["content"]["must_not_modify"] == ["bar()"]
+
+
+def test_must_not_modify_cannot_overlap_what_the_step_must_write():
+    with pytest.raises(AnalysisError, match="overlaps allowed_write"):
+        v(_mutate(["guardrails", "content"], {"must_not_modify": ["src/foo.py"], "must_preserve": []}))
+    # function names and unrelated files are fine
+    assert v(_mutate(["guardrails", "content"], {"must_not_modify": ["bar()", "src/other.py"], "must_preserve": []}))
+
+
+def test_review_findings_reach_harness_generation_prompt():
+    memory, sid, task = setup()
+    seen = []
+
+    class Spy(FakeClient):
+        def create(self, **kwargs):
+            seen.append(kwargs["messages"][0]["content"])
+            return super().create(**kwargs)
+
+    findings = [{"severity": "critical", "issue": "must_not_modify blocks the edit", "recommendation": "remove it"}]
+    run_harness_generation(task, {**PLAN, "substeps": [STEP]}, memory, Spy(json.dumps(GOOD)), REG, review_findings=findings)
+    assert "REJECTED by an independent reviewer" in seen[0] and "blocks the edit" in seen[0]
+
+
+def test_step_duration_has_a_floor():
+    d = good()
+    d["guardrails"]["limits"]["max_duration_seconds"] = 5
+    assert v(d)["guardrails"]["limits"]["max_duration_seconds"] == 60
 
 
 def test_run_generation_escalates_on_low_confidence():
