@@ -22,6 +22,7 @@ from helpers.guardrails import check_call
 from helpers.session_memory import SessionMemory, SessionState
 from helpers.snapshots import SnapshotError, record_before_mutation, rollback_entries
 from helpers.tool_registry import ToolSpec, load_registry, resolve_entrypoint, to_tool_param
+from helpers.workspace_diff import diff_trees, snapshot_tree
 from tools.get_file_content import get_file_content, schema_get_file_content
 from tools.get_files_info import get_files_info, schema_get_files_info
 from tools.run_python_file import run_python_file, schema_run_python_file
@@ -97,11 +98,16 @@ def _short_args(args: Dict[str, Any]) -> Dict[str, Any]:
     return {k: (v if not isinstance(v, str) or len(v) <= 200 else v[:200] + "...") for k, v in args.items()}
 
 
-def _build_prompt(task: TaskObject, harness: Dict[str, Any], prior: List[str]) -> str:
+def _build_prompt(task: TaskObject, harness: Dict[str, Any], prior: List[str], feedback: Optional[str] = None) -> str:
     g = harness["guardrails"]
     scope, limits, content = g["scope"], g["limits"], g.get("content") or {}
     prior_block = "\n".join(prior) if prior else "(none)"
+    retry_block = (
+        f"\nYOUR PREVIOUS ATTEMPT AT THIS STEP FAILED. Its changes were undone. Problems found:\n{feedback}\n"
+        if feedback else ""
+    )
     return f"""OVERALL TASK: {task.user_prompt}
+{retry_block}
 
 YOUR STEP ({harness['step_id']}): {harness['goal']}
 SUCCESS CRITERIA:
@@ -121,7 +127,7 @@ Do only this step. When finished, reply in plain text with: what you did, which 
 
 
 def execute_step(step_id: int, task: TaskObject, memory: SessionMemory, client, working_dir: str,
-                 registry: Optional[Dict[str, ToolSpec]] = None) -> Dict[str, Any]:
+                 registry: Optional[Dict[str, ToolSpec]] = None, feedback: Optional[str] = None) -> Dict[str, Any]:
     """Run one step inside its harness. Returns the execution log entry (also stored in memory).
 
     status: "completed" (session moves to verifying) | "blocked" (too many guardrail violations) |
@@ -166,7 +172,8 @@ def execute_step(step_id: int, task: TaskObject, memory: SessionMemory, client, 
     limits = harness["guardrails"]["limits"]
     tool_params = [_model_schema(registry[t]) for t in allowed]
     prior = [f"Step {d}: {_trim(logs[d].get('final_text', ''), 1000)}" for d in step_def["dependencies"]]
-    messages: List[Dict[str, Any]] = [{"role": "user", "content": _build_prompt(task, harness, prior)}]
+    messages: List[Dict[str, Any]] = [{"role": "user", "content": _build_prompt(task, harness, prior, feedback)}]
+    tree_before = snapshot_tree(working_dir)
 
     calls_made: Dict[str, int] = {}
     tool_log: List[Dict[str, Any]] = []
@@ -257,6 +264,7 @@ def execute_step(step_id: int, task: TaskObject, memory: SessionMemory, client, 
     log = {
         "step_id": step_id, "status": status, "reason": reason, "final_text": final_text,
         "tool_calls": tool_log, "calls_made": calls_made, "violations": violations,
+        "changed_files": diff_trees(tree_before, snapshot_tree(working_dir)),
         "validation_mode": "normal" if harness["confidence_score"] >= CONFIDENCE_NORMAL else "tight",
         "possible_runaway_tool": runaway, "duration_seconds": round(time.monotonic() - started, 3),
         "input_tokens": tokens_in, "output_tokens": tokens_out, "model": config.EXECUTION_MODEL,
